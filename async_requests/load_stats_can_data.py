@@ -137,7 +137,15 @@ def vectors_to_df(vectors, periods=1, start_release_date=None, end_release_date=
         df = pd.concat([df, ser], axis=1, sort=True)
     return df
 
-async def import_stat_can_vector(vector_province_map, latestN, value_name, max_retries=5, retry_delay=2):
+async def import_stat_can_vector(
+    vector_province_map,
+    latestN,
+    value_name,
+    *,
+    max_retries=5,
+    retry_delay=2,
+    max_concurrency=5,
+):
     """
     Asynchronously fetch StatsCan vector data for multiple provinces in parallel.
     
@@ -146,33 +154,40 @@ async def import_stat_can_vector(vector_province_map, latestN, value_name, max_r
         latestN: Number of latest periods to fetch
         value_name: Name to assign to the value column
         max_retries: Maximum number of retry attempts for failed requests
-        retry_delay: Delay in seconds between retries
+        retry_delay: Base delay in seconds between retries (exponential backoff)
+        max_concurrency: Maximum number of concurrent vector downloads
     
     Returns:
         DataFrame with combined data from all vectors
     """
     
+    semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
     async def fetch_vector(vector_id, province):
         """Helper function to fetch a single vector asynchronously with retry logic"""
-        for attempt in range(max_retries):
-            try:
-                # Create a new StatsCan instance for each request to avoid connection sharing
-                # Run the synchronous I/O operation in a thread pool to avoid blocking
-                loop = asyncio.get_event_loop()
-                vc = await loop.run_in_executor(
-                    None, 
-                    # lambda: StatsCan().vectors_to_df_remote(vector_id, latestN, None, None)
-                    lambda: vectors_to_df(vector_id, latestN, None, None)
-                )
-                break  # Exit the retry loop if successful
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    print(f"Attempt {attempt + 1} failed for vector {vector_id} ({province}): {str(e)}")
-                    print(f"Retrying in {retry_delay} seconds...")
-                    await asyncio.sleep(retry_delay)
-                else:
-                    print(f"Failed to fetch vector {vector_id} ({province}) after {max_retries} attempts: {str(e)}")
-                    raise
+        async with semaphore:
+            for attempt in range(max_retries):
+                try:
+                    # Offload synchronous network call to a worker thread to avoid blocking the loop
+                    vc = await asyncio.to_thread(
+                        vectors_to_df, vector_id, latestN, None, None
+                    )
+                    break  # Exit the retry loop if successful
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)
+                        print(
+                            "Attempt "
+                            f"{attempt + 1} failed for vector {vector_id} ({province}): {str(e)}"
+                        )
+                        print(f"Retrying in {wait_time} seconds...")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        print(
+                            "Failed to fetch vector "
+                            f"{vector_id} ({province}) after {max_retries} attempts: {str(e)}"
+                        )
+                        raise
             
         # Add metadata columns
         vc["Province"] = province
@@ -200,13 +215,20 @@ async def import_stat_can_vector(vector_province_map, latestN, value_name, max_r
     
     # Execute all tasks concurrently
     vcs = await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     # Filter out exceptions and collect successful results
     successful_vcs = [vc for vc in vcs if not isinstance(vc, Exception)]
-    failed_count = len(vcs) - len(successful_vcs)
-    
-    if failed_count > 0:
-        raise ValueError(f"Warning: {failed_count} out of {len(vcs)} vectors failed to fetch")
+    failures = [vc for vc in vcs if isinstance(vc, Exception)]
+
+    if failures:
+        failure_messages = ", ".join(str(err) for err in failures)
+        warnings.warn(
+            f"{len(failures)} out of {len(vcs)} vectors failed to fetch: {failure_messages}",
+            RuntimeWarning,
+        )
+
+    if not successful_vcs:
+        raise RuntimeError("Unable to fetch any vectors successfully")
 
     
     # Concatenate all individual vector DataFrames into one
