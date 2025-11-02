@@ -164,7 +164,7 @@ async def import_stat_can_vector(vector_province_map, latestN, value_name, max_r
                     # lambda: StatsCan().vectors_to_df_remote(vector_id, latestN, None, None)
                     lambda: vectors_to_df(vector_id, latestN, None, None)
                 )
-
+                break  # Exit the retry loop if successful
             except Exception as e:
                 if attempt < max_retries - 1:
                     print(f"Attempt {attempt + 1} failed for vector {vector_id} ({province}): {str(e)}")
