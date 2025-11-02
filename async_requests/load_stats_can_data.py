@@ -137,82 +137,111 @@ def vectors_to_df(vectors, periods=1, start_release_date=None, end_release_date=
         df = pd.concat([df, ser], axis=1, sort=True)
     return df
 
-async def import_stat_can_vector(vector_province_map, latestN, value_name, max_retries=5, retry_delay=2):
+def _canonicalize_vector_map(vector_province_map):
+    """Return a mapping keyed by canonical 'v{vectorId}' strings."""
+
+    return {
+        f"v{normalize_vector_id(vector)}": province
+        for vector, province in vector_province_map.items()
+    }
+
+
+def _tidy_vector_frame(raw_df, canonical_map, value_name):
+    """Reshape a wide StatsCan DataFrame into the expected long format."""
+
+    if raw_df.empty:
+        return pd.DataFrame(columns=["refPer", "Value", "Province", "VectorID", "Value_name"])
+
+    # Make sure the index is clearly labeled before resetting it.
+    raw_df = raw_df.copy()
+    raw_df.index.name = "refPer"
+    long_df = raw_df.reset_index().melt(
+        id_vars="refPer",
+        var_name="VectorID",
+        value_name="Value",
+    )
+
+    # Attach province metadata and drop any rows we cannot map.
+    long_df["Province"] = long_df["VectorID"].map(canonical_map)
+    long_df = long_df.dropna(subset=["Province", "Value"])
+
+    long_df["Value_name"] = value_name
+    return long_df[["refPer", "Value", "Province", "VectorID", "Value_name"]]
+
+
+def _fetch_vector_chunk(chunk, latestN, canonical_map, value_name):
+    """Synchronous helper that fetches and reshapes a group of vectors."""
+
+    df = vectors_to_df(chunk, latestN, None, None)
+    return _tidy_vector_frame(df, canonical_map, value_name)
+
+
+async def import_stat_can_vector(
+    vector_province_map,
+    latestN,
+    value_name,
+    *,
+    max_retries=4,
+    retry_delay=2,
+    max_concurrency=3,
+    chunk_size=25,
+):
     """
-    Asynchronously fetch StatsCan vector data for multiple provinces in parallel.
-    
+    Asynchronously fetch StatsCan vector data with bounded concurrency.
+
     Args:
         vector_province_map: Dictionary mapping vector_id to province name
         latestN: Number of latest periods to fetch
         value_name: Name to assign to the value column
         max_retries: Maximum number of retry attempts for failed requests
-        retry_delay: Delay in seconds between retries
-    
+        retry_delay: Base delay in seconds between retries (exponential backoff)
+        max_concurrency: Maximum number of concurrent vector chunk downloads
+        chunk_size: Number of vectors to request per StatsCan call
+
     Returns:
         DataFrame with combined data from all vectors
     """
-    
-    async def fetch_vector(vector_id, province):
-        """Helper function to fetch a single vector asynchronously with retry logic"""
-        for attempt in range(max_retries):
-            try:
-                # Create a new StatsCan instance for each request to avoid connection sharing
-                # Run the synchronous I/O operation in a thread pool to avoid blocking
-                loop = asyncio.get_event_loop()
-                vc = await loop.run_in_executor(
-                    None, 
-                    # lambda: StatsCan().vectors_to_df_remote(vector_id, latestN, None, None)
-                    lambda: vectors_to_df(vector_id, latestN, None, None)
-                )
-                break  # Exit the retry loop if successful
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    print(f"Attempt {attempt + 1} failed for vector {vector_id} ({province}): {str(e)}")
-                    print(f"Retrying in {retry_delay} seconds...")
-                    await asyncio.sleep(retry_delay)
-                else:
-                    print(f"Failed to fetch vector {vector_id} ({province}) after {max_retries} attempts: {str(e)}")
-                    raise
-            
-        # Add metadata columns
-        vc["Province"] = province
-        vc["VectorID"] = vector_id
-        
-        # Rename column named after vector_id to 'Value' if needed
-        if vector_id in vc.columns:
-            vc = vc.rename(columns={vector_id: "Value"})
-        
-        # Reset index to convert index to a column if necessary
-        vc.reset_index(inplace=True)
-        
-        # Ensure consistent column order before returning
-        desired_columns = ['refPer', 'Value', 'Province', 'VectorID']
-        vc = vc[desired_columns]
-        
-        return vc
 
-    
-    # Create tasks for all vector fetches
-    tasks = [
-        fetch_vector(vector_id, province) 
-        for vector_id, province in vector_province_map.items()
-    ]
-    
-    # Execute all tasks concurrently
-    vcs = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Filter out exceptions and collect successful results
-    successful_vcs = [vc for vc in vcs if not isinstance(vc, Exception)]
-    failed_count = len(vcs) - len(successful_vcs)
-    
-    if failed_count > 0:
-        raise ValueError(f"Warning: {failed_count} out of {len(vcs)} vectors failed to fetch")
+    semaphore = asyncio.Semaphore(max(1, max_concurrency))
+    canonical_map = _canonicalize_vector_map(vector_province_map)
+    vector_ids = list(canonical_map.keys())
+    chunks = list(chunked(vector_ids, max(1, chunk_size)))
 
-    
-    # Concatenate all individual vector DataFrames into one
-    all_vcs = pd.concat(successful_vcs, ignore_index=True)
-    all_vcs["Value_name"] = value_name
-    return all_vcs
+    async def fetch_chunk(chunk):
+        async with semaphore:
+            for attempt in range(max_retries):
+                try:
+                    return await asyncio.to_thread(
+                        _fetch_vector_chunk, chunk, latestN, canonical_map, value_name
+                    )
+                except Exception as exc:
+                    if attempt >= max_retries - 1:
+                        raise
+                    wait_time = retry_delay * (2 ** attempt)
+                    print(
+                        "Attempt "
+                        f"{attempt + 1} failed for chunk {chunk}: {exc}. Retrying in {wait_time} s"
+                    )
+                    await asyncio.sleep(wait_time)
+
+    tasks = [asyncio.create_task(fetch_chunk(chunk)) for chunk in chunks]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    successful_frames = [res for res in results if isinstance(res, pd.DataFrame)]
+    failures = [err for err in results if isinstance(err, Exception)]
+
+    if failures:
+        failure_messages = "; ".join(str(err) for err in failures)
+        warnings.warn(
+            f"{len(failures)} out of {len(results)} vector chunks failed: {failure_messages}",
+            RuntimeWarning,
+        )
+
+    if not successful_frames:
+        raise RuntimeError("Unable to fetch any vectors successfully")
+
+    combined = pd.concat(successful_frames, ignore_index=True)
+    return combined[["refPer", "Value", "Province", "VectorID", "Value_name"]]
 
 
 #details on stat can-> https://www150.statcan.gc.ca/t1/tbl1/en/cv!recreate.action?pid=3410028501&selectedNodeIds=1D2,1D3,1D4,1D5,1D6,1D7,1D8,1D9,1D10,1D11,1D12,1D13,1D14,2D4,3D6,4D5,5D1&checkedLevels=&refPeriods=20220101,20250301&dimensionLayouts=layout3,layout3,layout3,layout3,layout3,layout2&vectorDisplay=true
